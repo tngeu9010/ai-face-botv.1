@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>AI Face (GitHub Only)</title>
+  <style>
+    html, body { margin:0; height:100%; background:#0b0f14; overflow:hidden; touch-action:manipulation; }
+    canvas { display:block; width:100vw; height:100vh; }
+    /* Dashboard overlay (ซ่อนใน Face mode) */
+    #dash {
+      position:fixed; inset:0;
+      display:none;
+      background:rgba(11,15,20,.95);
+      color:#e7eef7;
+      font:14px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+      padding:12px;
+    }
+    #dash .grid {
+      display:grid; grid-template-columns:1fr; gap:10px;
+      max-width:900px; margin:0 auto;
+    }
+    #camWrap {
+      border:1px solid rgba(31,43,60,.8);
+      border-radius:16px; overflow:hidden;
+      background:#000;
+    }
+    video { width:100%; height:auto; display:block; }
+    .card {
+      border:1px solid rgba(31,43,60,.8);
+      border-radius:16px;
+      background:rgba(18,26,36,.9);
+      padding:10px 12px;
+      white-space:pre-wrap;
+      line-height:1.35;
+    }
+    .muted { color: rgba(231,238,247,.65); font-size:12px; }
+  </style>
+</head>
+<body>
+  <!-- Dashboard (no buttons) -->
+  <section id="dash">
+    <div class="grid">
+      <div id="camWrap">
+        <video id="video" playsinline autoplay muted></video>
+      </div>
+      <div class="card" id="events"></div>
+      <div class="card" id="memory"></div>
+      <div class="card muted">
+        Gesture:
+        - แตะ 1 ครั้ง: พูดทัก/ตอบกลับแบบสุภาพ (TTS ของเครื่อง)
+        - แตะ 2 ครั้ง: สลับ Face ↔ Dashboard
+        - กดค้าง 1 วินาที: สลับกล้องหน้า/หลัง (เฉพาะ Dashboard)
+      </div>
+    </div>
+  </section>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+
+    // -----------------------------
+    // State
+    // -----------------------------
+    let mode = "face";               // "face" | "dash"
+    let armed = false;               // เงียบจนกว่าจะ "แตะครั้งแรก"
+    let useFront = true;
+    let mediaStream = null;
+    let speaking = false;
+
+    const dash = document.getElementById("dash");
+    const video = document.getElementById("video");
+    const eventsEl = document.getElementById("events");
+    const memoryEl = document.getElementById("memory");
+
+    // local memory (GitHub-only)
+    const MEM_KEY = "ai_face_github_only_memory_v1";
+    const memory = JSON.parse(localStorage.getItem(MEM_KEY) || "{}");
+    if (!memory.lastSpoken) memory.lastSpoken = "ยังไม่มีข้อความล่าสุด";
+    if (!memory.greetCount) memory.greetCount = 0;
+
+    function saveMemory() {
+      localStorage.setItem(MEM_KEY, JSON.stringify(memory));
+      memoryEl.textContent =
+`Memory (localStorage):
+- greetCount: ${memory.greetCount}
+- lastSpoken: ${memory.lastSpoken}`;
+    }
+
+    function logEvent(msg) {
+      const line = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+      eventsEl.textContent = line + (eventsEl.textContent || "");
+    }
+
+    saveMemory();
+    logEvent("Ready (silent until first tap)");
+
+    // -----------------------------
+    // 3D Face (Three.js)
+    // -----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0f14);
+
+    const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, 100);
+    camera.position.set(0, 0.2, 3.0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias:true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    document.body.insertBefore(renderer.domElement, dash);
+
+    // lights
+    const key = new THREE.DirectionalLight(0xffffff, 1.2); key.position.set(2, 2, 3); scene.add(key);
+    const fill = new THREE.DirectionalLight(0xffffff, 0.6); fill.position.set(-2, 1, 2); scene.add(fill);
+    const rim = new THREE.DirectionalLight(0xffffff, 0.5); rim.position.set(0, 2, -3); scene.add(rim);
+
+    // head
+    const headMat = new THREE.MeshStandardMaterial({ color: 0xE9F2FF, roughness: 0.35, metalness: 0.05 });
+    const head = new THREE.Mesh(new THREE.SphereGeometry(1.0, 48, 48), headMat);
+    scene.add(head);
+
+    // cheeks
+    const cheekMat = new THREE.MeshStandardMaterial({ color: 0xFFB3C7, roughness: 0.6, metalness: 0.0 });
+    const cheekGeo = new THREE.SphereGeometry(0.18, 24, 24);
+    const cheekL = new THREE.Mesh(cheekGeo, cheekMat);
+    const cheekR = new THREE.Mesh(cheekGeo, cheekMat);
+    cheekL.position.set(-0.55, -0.15, 0.78);
+    cheekR.position.set( 0.55, -0.15, 0.78);
+    cheekL.scale.set(1.3, 0.9, 0.6);
+    cheekR.scale.set(1.3, 0.9, 0.6);
+    scene.add(cheekL, cheekR);
+
+    // eyes + pupils
+    const eyeWhiteMat = new THREE.MeshStandardMaterial({ color: 0xFFFFFF, roughness: 0.2, metalness: 0.0 });
+    const pupilMat = new THREE.MeshStandardMaterial({ color: 0x0b0f14, roughness: 0.6, metalness: 0.0 });
+    const eyeGeo = new THREE.SphereGeometry(0.22, 32, 32);
+    const pupilGeo = new THREE.SphereGeometry(0.08, 24, 24);
+    const eyeL = new THREE.Mesh(eyeGeo, eyeWhiteMat);
+    const eyeR = new THREE.Mesh(eyeGeo, eyeWhiteMat);
+    const pupilL = new THREE.Mesh(pupilGeo, pupilMat);
+    const pupilR = new THREE.Mesh(pupilGeo, pupilMat);
+    eyeL.position.set(-0.38, 0.22, 0.78);
+    eyeR.position.set( 0.38, 0.22, 0.78);
+    pupilL.position.set(-0.38, 0.22, 0.90);
+    pupilR.position.set( 0.38, 0.22, 0.90);
+    scene.add(eyeL, eyeR, pupilL, pupilR);
+
+    // mouth
+    const mouthMat = new THREE.MeshStandardMaterial({ color: 0x0b0f14, roughness: 0.7, metalness: 0.0 });
+    const mouth = new THREE.Mesh(new THREE.CapsuleGeometry(0.18, 0.02, 8, 16), mouthMat);
+    mouth.position.set(0, -0.20, 0.86);
+    mouth.rotation.z = Math.PI / 2;
+    scene.add(mouth);
+
+    // blink
+    let blinkState = 0; // 0 open, 1 closing, 2 opening
+    let blinkT = 0;
+    let nextBlinkAt = 1.2 + Math.random() * 2.4;
+    function blinkOnce(){ blinkState = 1; blinkT = 0; }
+
+    // idle motion
+    let t = 0;
+
+    // -----------------------------
+    // TTS (local, no AI)
+    // -----------------------------
+    function speak(text) {
+      // เงียบจนกว่าจะ armed และมี user gesture แล้ว (เราจะเรียกจาก gesture เท่านั้น)
+      if (!armed) return;
+
+      speaking = true;
+      memory.lastSpoken = text;
+      saveMemory();
+
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "th-TH";
+      u.rate = 1.0;
+      u.pitch = 1.0;
+
+      u.onend = () => { speaking = false; };
+      speechSynthesis.cancel();
+      speechSynthesis.speak(u);
+    }
+
+    function politeReply() {
+      // ตอบสุภาพแบบผู้ช่วย (6B)
+      const options = [
+        "สวัสดีครับ ต้องการให้ช่วยเรื่องใดครับ",
+        "รับทราบครับ หากต้องการให้ผมแสดงกล้อง ให้ดับเบิลแท็ปเพื่อเข้าโหมดแดชบอร์ดครับ",
+        "ได้ครับ หากต้องการสลับกล้องหน้าและหลัง ให้กดค้างหนึ่งวินาทีในโหมดแดชบอร์ดครับ",
+      ];
+      return options[Math.floor(Math.random() * options.length)];
+    }
+
+    // -----------------------------
+    // Camera (GitHub-only)
+    // -----------------------------
+    async function stopCamera() {
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(t => t.stop());
+        mediaStream = null;
+      }
+      video.srcObject = null;
+    }
+
+    async function startCamera() {
+      await stopCamera();
+      const constraints = {
+        audio: false,
+        video: { facingMode: useFront ? "user" : "environment", width: { ideal: 1280 }, height: { ideal: 720 } }
+      };
+      mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = mediaStream;
+      logEvent(`Camera on (${useFront ? "front" : "back"})`);
+    }
+
+    // -----------------------------
+    // Mode switching (no buttons)
+    // - single tap: greet / reply
+    // - double tap: toggle mode face<->dash
+    // - long press (>= 600ms): toggle camera (dash only)
+    // -----------------------------
+    let tapTimer = null;
+    let lastTapAt = 0;
+    let pressTimer = null;
+    let pressed = false;
+
+    function setMode(nextMode) {
+      mode = nextMode;
+      if (mode === "dash") {
+        dash.style.display = "block";
+        startCamera().catch(() => logEvent("Camera permission denied"));
+      } else {
+        dash.style.display = "none";
+        stopCamera();
+      }
+      logEvent(`Mode -> ${mode}`);
+    }
+
+    function onSingleTap() {
+      if (!armed) {
+        armed = true; // ปลดล็อก: จากนี้ถึงพูดได้
+        logEvent("Armed (audio unlocked by tap)");
+        // เงียบอยู่—แต่คุณแตะครั้งแรกแล้ว เราจะทักสั้น ๆ
+        memory.greetCount += 1;
+        saveMemory();
+        speak("สวัสดีครับ พร้อมช่วยครับ");
+        blinkOnce();
+        return;
+      }
+
+      // subsequent single tap: polite reply
+      speak(politeReply());
+      blinkOnce();
+    }
+
+    function onDoubleTap() {
+      if (!armed) {
+        // ถ้ายังไม่ armed ให้ถือว่าแตะครั้งแรกก่อน แล้วค่อยสลับ
+        armed = true;
+        logEvent("Armed (audio unlocked by tap)");
+      }
+      setMode(mode === "face" ? "dash" : "face");
+      blinkOnce();
+    }
+
+    function onLongPress() {
+      if (mode !== "dash") return;
+      useFront = !useFront;
+      startCamera().catch(() => logEvent("Camera switch failed"));
+      blinkOnce();
+    }
+
+    window.addEventListener("pointerdown", () => {
+      pressed = true;
+      pressTimer = setTimeout(() => {
+        if (pressed) {
+          // long press
+          if (tapTimer) { clearTimeout(tapTimer); tapTimer = null; }
+          onLongPress();
+        }
+      }, 650);
+    }, { passive:true });
+
+    window.addEventListener("pointerup", () => {
+      pressed = false;
+      if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+
+      const now = Date.now();
+      const dt = now - lastTapAt;
+      lastTapAt = now;
+
+      // double tap threshold ~280ms
+      if (dt > 0 && dt < 280) {
+        if (tapTimer) { clearTimeout(tapTimer); tapTimer = null; }
+        onDoubleTap();
+      } else {
+        // single tap: wait briefly to see if second tap arrives
+        tapTimer = setTimeout(() => {
+          onSingleTap();
+          tapTimer = null;
+        }, 300);
+      }
+    }, { passive:true });
+
+    // -----------------------------
+    // Render loop
+    // -----------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+      t += 0.016;
+
+      // float + subtle rotation
+      head.position.y = Math.sin(t*0.7) * 0.03;
+      head.rotation.y = Math.sin(t*0.35) * 0.08;
+
+      // pupils wander gently
+      const px = Math.sin(t*0.9) * 0.03;
+      const py = Math.cos(t*0.8) * 0.02;
+      pupilL.position.x = -0.38 + px;
+      pupilR.position.x =  0.38 + px;
+      pupilL.position.y =  0.22 + py;
+      pupilR.position.y =  0.22 + py;
+
+      // mouth animation while speaking (approx)
+      if (speaking) {
+        const s = 1.0 + (Math.sin(t*18) * 0.25 + 0.25);
+        mouth.scale.y = s;
+        mouth.scale.x = 1.0 + (Math.sin(t*18) * 0.10);
+      } else {
+        mouth.scale.set(1, 1, 1);
+      }
+
+      // blink schedule
+      nextBlinkAt -= 0.016;
+      if (nextBlinkAt <= 0) {
+        blinkOnce();
+        nextBlinkAt = 1.2 + Math.random() * 2.4;
+      }
+
+      // blink animation
+      if (blinkState !== 0) {
+        blinkT += 0.06;
+        if (blinkState === 1) {
+          const k = Math.max(0.08, 1 - blinkT);
+          eyeL.scale.y = k; eyeR.scale.y = k;
+          if (blinkT >= 1) { blinkState = 2; blinkT = 0; }
+        } else {
+          const k = Math.min(1, blinkT);
+          eyeL.scale.y = k; eyeR.scale.y = k;
+          if (blinkT >= 1) { blinkState = 0; eyeL.scale.y = 1; eyeR.scale.y = 1; }
+        }
+      }
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // resize
+    window.addEventListener("resize", () => {
+      camera.aspect = innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    // start in face mode (silent)
+    setMode("face");
+  </script>
+</body>
+</html>
